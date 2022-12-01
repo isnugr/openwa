@@ -23,6 +23,27 @@ export const chatwoot_webhook_check_event_name = "cli.integrations.chatwoot.chec
 export type expressMiddleware = (req: Request, res: Response) => Promise<Response<any, Record<string, any>>>
 
 export const chatwootMiddleware: (cliConfig: cliFlags, client: Client) => expressMiddleware = (cliConfig: cliFlags, client: Client) => {
+    const u = cliConfig.chatwootUrl as string //e.g `"localhost:3000/api/v1/accounts/3"
+    const api_access_token = cliConfig.chatwootApiAccessToken as string
+    const _u = new URL(u)
+    const origin = _u.origin;
+    const port = _u.port || 80;
+    const [accountId, inboxId] = u.match(/\/(app|(api\/v1))\/accounts\/\d*\/(inbox|inboxes)\/\d*/g)[0].split('/').filter(Number)
+    // const accountId = u.match(/accounts\/\d*/g) && u.match(/accounts\/\d*/g)[0].replace('accounts/', '')
+    const resolvedInbox = inboxId || u.match(/inboxes\/\d*/g) && u.match(/inboxes\/\d*/g)[0].replace('inboxes/', '')
+    const cwReq = (path, method, data?: any, _headers ?: any) => {
+        const url = `${origin}/api/v1/accounts/${accountId}/${path}`.replace('app.bentonow.com','chat.bentonow.com')
+        // console.log(url,method,data)
+        return axios({
+            method,
+            data,
+            url,
+            headers: {
+                api_access_token,
+                ..._headers
+            }
+        })
+    }
     return async (req: Request, res: Response): Promise<Response<any, Record<string, any>>> => {
         const processMesssage = async () => {
             const promises = [];
@@ -30,7 +51,8 @@ export const chatwootMiddleware: (cliConfig: cliFlags, client: Client) => expres
             if(!body) return;
             if(!body.conversation) return;
             const m = body.conversation.messages[0];
-            const contact = (body.conversation.meta.sender.phone_number || "").replace('+', '')
+            //const contact = (body.conversation.meta.sender.phone_number || "").replace('+', '')
+            const contact = body.conversation.meta.sender.identifier
             if (
                 body.message_type === "incoming" ||
                 body.private ||
@@ -39,7 +61,8 @@ export const chatwootMiddleware: (cliConfig: cliFlags, client: Client) => expres
                 !contact
             ) return;
             const { attachments, content } = m
-            const to = `${contact}@c.us` as ChatId;
+            //const to = `${contact}@c.us` as ChatId;
+            const to = `${contact}` as ChatId;
             if(!convoReg[to]) convoReg[to] = body.conversation.id;
             if (attachments?.length > 0) {
                 //has attachments
@@ -75,12 +98,27 @@ export const chatwootMiddleware: (cliConfig: cliFlags, client: Client) => expres
                 }
             }
             const outgoingMessageIds = await Promise.all(promises)
+            const waMessageId = outgoingMessageIds[0];
+            await updateWaMessageId(m.id, to, waMessageId);
+
             log.info(`Outgoing message IDs: ${JSON.stringify(outgoingMessageIds)}`)
             /**
              * Add these message IDs to the ignore map
              */
             outgoingMessageIds.map(id=>ignoreMap[`${id}`]=true)
             return outgoingMessageIds
+        }
+        const updateWaMessageId = async (cwMessageId,contactId, waMessageId) => {
+            try {
+                const {data} = await cwReq(`conversations/${convoReg[contactId]}/messages/${cwMessageId}`, 'put', {
+                    external_message_id: waMessageId
+                });
+                console.log(data, 'update wa messageId')
+                return data;
+            }catch(error) {
+                console.log(error, 'error update wa messageId')
+                return
+            }
         }
         try {
             const processAndSendResult = await processMesssage();
@@ -227,9 +265,11 @@ export const setupChatwootOutgoingMessageHandler: (cliConfig: cliFlags, client: 
     /**
      * Get Contacts and conversations
      */
-    const searchContact = async (number: string) => {
+    const searchContact = async (number: string, isGroup: Boolean) => {
         try {
-            const n = number.replace('@c.us', '')
+            //const n = number.replace('@c.us', '')
+            let phoneGroup = `62${number.replace('@g.us', '').substring(0, 12)}`
+            const n = isGroup ? phoneGroup : number.replace('@c.us', '')
             const { data } = await cwReq('get',`contacts/search?q=${n}&sort=phone_number`)
             if (data.payload.length) {
                 return data.payload.find(x => (x.phone_number || "").includes(n)) || false
@@ -268,12 +308,14 @@ export const setupChatwootOutgoingMessageHandler: (cliConfig: cliFlags, client: 
         }
     }
 
-    const createContact = async (contact: Contact) => {
+    const createContact = async (contact: Contact, isGroup: Boolean) => {
         try {
+            let phone = isGroup ? `+62${contact.alternativePhone}` : `+${contact.id.replace('@c.us', '')}`
             const { data } = await cwReq('post', `contacts`, {
                 "identifier": contact.id,
                 "name": contact.formattedName || contact.id,
-                "phone_number": `+${contact.id.replace('@c.us', '')}`,
+                //"phone_number": `+${contact.id.replace('@c.us', '')}`,
+                "phone_number": phone,
                 "avatar_url": contact.profilePicThumbObj.eurl
             })
             return data.payload.contact
@@ -326,20 +368,30 @@ export const setupChatwootOutgoingMessageHandler: (cliConfig: cliFlags, client: 
     }
 
     const processWAMessage = async (message : Message) => {
+        let isGroup = false;
         if (message.chatId.includes('g')) {
             //chatwoot integration does not support group chats
-            return;
+            //return;
+            isGroup = true;
         }
         /**
          * Does the contact exist in chatwoot?
          */
         if (!contactReg[message.chatId]) {
-            const contact = await searchContact(message.chatId)
+            //const contact = await searchContact(message.chatId)
+            const contact = await searchContact(message.chatId, isGroup)
             if (contact) {
                 contactReg[message.chatId] = contact.id
             } else {
                 //create the contact
-                contactReg[message.chatId] = (await createContact(message.sender)).id
+                //contactReg[message.chatId] = (await createContact(message.sender)).id
+                if(isGroup) {
+                    let contactGroup = message.chat.contact
+                    contactGroup['alternativePhone'] = message.chat.contact.id.replace('@g.us', '').substring(0,12)
+                    contactReg[message.chatId] = (await createContact(contactGroup, isGroup))?.id
+                }else {
+                    contactReg[message.chatId] = (await createContact(message.sender, isGroup)).id
+                }
             }
         }
 
@@ -349,12 +401,14 @@ export const setupChatwootOutgoingMessageHandler: (cliConfig: cliFlags, client: 
                 convoReg[message.chatId] = conversation.id
             } else {
                 //create the conversation
-                convoReg[message.chatId] = (await createConversation(contactReg[message.chatId])).id
+                //convoReg[message.chatId] = (await createConversation(contactReg[message.chatId])).id
+                convoReg[message.from] = (await createConversation(contactReg[message.from]))?.id
             }
         }
         /**
          * Does the conversation exist in 
          */
+        let senderGroup = `${message.sender.id.replace('@c.us', '')}(${message.sender.formattedName})`
         let text = message.body;
         let hasAttachments = false;
         switch (message.type) {
@@ -380,6 +434,7 @@ export const setupChatwootOutgoingMessageHandler: (cliConfig: cliFlags, client: 
                 text = message?.ctwaContext?.sourceUrl ? `${message.body}\n\n${message.ctwaContext.sourceUrl}` : message.body || "__UNHANDLED__";
                 break;
         }
+        text = isGroup ? `${text}\nmessage by ${senderGroup}` : text;
         if(hasAttachments) await sendAttachmentMessage(text, message.chatId, message)
         else await sendConversationMessage(text, message.chatId, message)
     }

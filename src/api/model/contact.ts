@@ -49,4 +49,5 @@ export interface Contact {
   verifiedName: string;
   isOnline?: boolean;
   lastSeen?: number;
+  alternativePhone: string;
 }
