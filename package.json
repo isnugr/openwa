@@ -83,7 +83,7 @@
     "@typescript-eslint/parser": "^5.10.1",
     "auto-changelog": "^2.0.0",
     "ava": "^4.0.1",
-    "changelog-parser": "^2.8.0",
+    "changelog-parser": "^3.0.0",
     "command-line-args": "^5.1.1",
     "docusaurus": "^1.14.7",
     "eslint": "^8.1.0",
